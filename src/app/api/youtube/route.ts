@@ -2,6 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const maxDuration = 30;
 
+const INNERTUBE_URL =
+  "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+const ANDROID_VERSION = "20.10.38";
+const ANDROID_UA = `com.google.android.youtube/${ANDROID_VERSION} (Linux; U; Android 14)`;
+
 function extractVideoId(url: string): string | null {
   const match = url.match(
     /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/
@@ -9,75 +14,72 @@ function extractVideoId(url: string): string | null {
   return match ? match[1] : null;
 }
 
-async function fetchYouTubePage(videoId: string): Promise<string> {
-  const response = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+async function getCaptionTracks(videoId: string) {
+  const res = await fetch(INNERTUBE_URL, {
+    method: "POST",
     headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-      Accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      "Accept-Encoding": "gzip, deflate, br",
-      Connection: "keep-alive",
-      "Upgrade-Insecure-Requests": "1",
-      "Sec-Fetch-Dest": "document",
-      "Sec-Fetch-Mode": "navigate",
-      "Sec-Fetch-Site": "none",
-      "Cache-Control": "max-age=0",
+      "Content-Type": "application/json",
+      "User-Agent": ANDROID_UA,
     },
+    body: JSON.stringify({
+      context: {
+        client: {
+          clientName: "ANDROID",
+          clientVersion: ANDROID_VERSION,
+        },
+      },
+      videoId,
+    }),
   });
 
-  if (!response.ok) {
-    throw new Error(`YouTube 페이지 로드 실패: ${response.status}`);
-  }
+  if (!res.ok) throw new Error(`InnerTube API 오류: ${res.status}`);
 
-  return response.text();
+  const data = await res.json();
+  const tracks =
+    data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+
+  if (!Array.isArray(tracks) || tracks.length === 0) return null;
+  return tracks as { baseUrl: string; languageCode: string }[];
 }
 
-function parseCaptionTracks(html: string): { baseUrl: string; languageCode: string; name: string }[] {
-  const match = html.match(/"captionTracks":(\[.*?\])/);
-  if (!match) return [];
-
-  try {
-    const tracks = JSON.parse(match[1]);
-    return tracks.map((t: { baseUrl: string; languageCode: string; name: { simpleText: string } }) => ({
-      baseUrl: t.baseUrl,
-      languageCode: t.languageCode,
-      name: t.name?.simpleText || t.languageCode,
-    }));
-  } catch {
-    return [];
-  }
-}
-
-async function fetchCaptionXml(baseUrl: string): Promise<string> {
-  const response = await fetch(baseUrl, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    },
-  });
-  return response.text();
-}
-
-function parseXmlTranscript(xml: string): string {
-  const textMatches = Array.from(xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g));
+function parseTranscriptXml(xml: string): string {
   const texts: string[] = [];
 
-  for (const match of textMatches) {
-    const text = match[1]
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&nbsp;/g, " ")
-      .replace(/<[^>]+>/g, "")
-      .trim();
-    if (text) texts.push(text);
+  // Format 1: <p t="..." d="..."><s>text</s></p>
+  const pMatches = Array.from(xml.matchAll(/<p\s[^>]*>([\s\S]*?)<\/p>/g));
+  if (pMatches.length > 0) {
+    for (const match of pMatches) {
+      const inner = match[1];
+      const sMatches = Array.from(inner.matchAll(/<s[^>]*>([^<]*)<\/s>/g));
+      let text = sMatches.map((m) => m[1]).join("");
+      if (!text) text = inner.replace(/<[^>]+>/g, "");
+      text = decodeEntities(text.trim());
+      if (text) texts.push(text);
+    }
+    return texts.join(" ");
   }
 
+  // Format 2: <text start="..." dur="...">text</text>
+  const textMatches = Array.from(
+    xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)
+  );
+  for (const match of textMatches) {
+    const text = decodeEntities(
+      match[1].replace(/<[^>]+>/g, "").trim()
+    );
+    if (text) texts.push(text);
+  }
   return texts.join(" ");
+}
+
+function decodeEntities(str: string): string {
+  return str
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ");
 }
 
 export async function POST(req: NextRequest) {
@@ -96,39 +98,46 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const html = await fetchYouTubePage(videoId);
-    const tracks = parseCaptionTracks(html);
-
-    if (tracks.length === 0) {
+    const tracks = await getCaptionTracks(videoId);
+    if (!tracks) {
       return NextResponse.json(
-        { error: "이 영상에는 자막이 없습니다. 직접 텍스트 입력을 이용해주세요." },
+        {
+          error:
+            "이 영상에는 자막이 없습니다. 직접 텍스트 입력을 이용해주세요.",
+        },
         { status: 404 }
       );
     }
 
-    // Prefer Korean, then English, then first available
+    // Prefer Korean, then English, then first
     const preferred = ["ko", "en"];
-    let selectedTrack = tracks[0];
+    let selected = tracks[0];
     for (const lang of preferred) {
       const found = tracks.find((t) => t.languageCode.startsWith(lang));
-      if (found) { selectedTrack = found; break; }
+      if (found) {
+        selected = found;
+        break;
+      }
     }
 
-    const xml = await fetchCaptionXml(selectedTrack.baseUrl);
-    const transcript = parseXmlTranscript(xml);
+    const xmlRes = await fetch(selected.baseUrl, {
+      headers: { "User-Agent": ANDROID_UA },
+    });
+
+    if (!xmlRes.ok) throw new Error("자막 XML 로드 실패");
+
+    const xml = await xmlRes.text();
+    const transcript = parseTranscriptXml(xml);
 
     if (!transcript) {
-      return NextResponse.json(
-        { error: "자막을 파싱할 수 없습니다." },
-        { status: 500 }
-      );
+      throw new Error("자막 내용을 파싱할 수 없습니다.");
     }
 
     return NextResponse.json({
       transcript,
       source: "youtube",
       videoId,
-      language: selectedTrack.languageCode,
+      language: selected.languageCode,
       charCount: transcript.length,
     });
   } catch (error) {
