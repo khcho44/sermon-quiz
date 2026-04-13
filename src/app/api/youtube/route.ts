@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { YoutubeTranscript } from "youtube-transcript";
+import * as ytModule from "youtube-transcript";
+const { YoutubeTranscript } = ytModule as unknown as { YoutubeTranscript: { fetchTranscript: (id: string, opts?: { lang?: string }) => Promise<{ text: string; duration: number; offset: number }[]> } };
 
 export const maxDuration = 30;
 
