@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { YoutubeTranscript } from "youtube-transcript";
 
+export const maxDuration = 30;
+
 export async function POST(req: NextRequest) {
   try {
     const { url } = await req.json();
@@ -63,6 +65,7 @@ export async function POST(req: NextRequest) {
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "알 수 없는 오류가 발생했습니다.";
+    console.error("YouTube transcript error:", error);
     return NextResponse.json(
       { error: `YouTube 자막 추출 실패: ${message}` },
       { status: 500 }
